@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 )
 
 // Map functions return a slice of KeyValue.
@@ -39,6 +41,8 @@ func Worker(mapf func(string, string) []KeyValue,
 	switch reply.TaskType {
 	case MapTask:
 		err = HandleMapTask(reply.Filename, reply.TaskID, reply.NReduce, mapf)
+	case ReduceTask:
+		err = HandleReduceTask(reply.TaskID, reply.NMap, reducef)
 	}
 
 	if err != nil {
@@ -46,18 +50,18 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 }
 
-func HandleMapTask(inputFile string, taskID, nReduce int, mapf func(string, string) []KeyValue) error {
+func HandleMapTask(inputFileName string, taskID, nReduce int, mapf func(string, string) []KeyValue) error {
 	if nReduce <= 0 {
 		return fmt.Errorf("number of reduce tasks must be positive: %d", nReduce)
 	}
 
-	content, err := os.ReadFile(inputFile)
+	content, err := os.ReadFile(inputFileName)
 	if err != nil {
-		return fmt.Errorf("read input %q: %w", inputFile, err)
+		return fmt.Errorf("read input %q: %w", inputFileName, err)
 	}
 
 	contentText := string(content)
-	intermediate := mapf(inputFile, contentText)
+	intermediate := mapf(inputFileName, contentText)
 
 	buckets := make([][]KeyValue, nReduce)
 	for _, kv := range intermediate {
@@ -89,6 +93,78 @@ func HandleMapTask(inputFile string, taskID, nReduce int, mapf func(string, stri
 			return fmt.Errorf("publish map output %q: %w", outputFileName, err)
 		}
 	}
+	return nil
+}
+
+func HandleReduceTask(taskID, nMap int, reducef func(string, []string) string) error {
+	var intermediate []KeyValue
+
+	for i := 0; i < nMap; i++ {
+		inputFileName := fmt.Sprintf("mr-%d-%d", i, taskID)
+		inputFile, err := os.Open(inputFileName)
+		if err != nil {
+			return fmt.Errorf("read input file %s:  %w", inputFileName, err)
+		}
+		defer inputFile.Close()
+
+		dec := json.NewDecoder(inputFile)
+		j := 0
+		for {
+			var kv KeyValue
+			err := dec.Decode(&kv)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("decoding data in file %s, line %d: %w", inputFileName, j, err)
+			}
+			intermediate = append(intermediate, kv)
+			j++
+		}
+		inputFile.Close()
+	}
+
+	sort.Slice(intermediate, func(i, j int) bool {
+		return intermediate[i].Key < intermediate[j].Key
+	})
+
+	tmpFile, err := os.CreateTemp(".", "mr-reduce-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary reduce output: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	j := 0
+	for j < len(intermediate) {
+		k := j + 1
+		for k < len(intermediate) && intermediate[k].Key == intermediate[j].Key {
+			k++
+		}
+
+		values := []string{}
+		for l := j; l < k; l++ {
+			values = append(values, intermediate[l].Value)
+		}
+
+		output := reducef(intermediate[j].Key, values)
+
+		if _, err := fmt.Fprintf(tmpFile, "%v %v\n", intermediate[j].Key, output); err != nil {
+			return err
+		}
+
+		j = k
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close reduce file: %w", err)
+	}
+
+	outputFileName := fmt.Sprintf("mr-out-%d", taskID)
+	if err := os.Rename(tmpFile.Name(), outputFileName); err != nil {
+		return fmt.Errorf("publish reduce output %q: %w", outputFileName, err)
+	}
+
 	return nil
 }
 
